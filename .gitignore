@@ -1,0 +1,6 @@
+dist/
+node_modules/
+*.tsbuildinfo
+# Local project working dirs / fixtures output
+projects/
+fixtures/*.mp4

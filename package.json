@@ -1,0 +1,44 @@
+{
+  "name": "@yolo-labs/videostitcher",
+  "version": "0.61.1",
+  "description": "Automated screencast voiceover pipeline — Gemini analysis → Claude script → ElevenLabs voiceover → ffmpeg stitch.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yolo-labs-hq/videostitcher.git"
+  },
+  "homepage": "https://github.com/yolo-labs-hq/videostitcher#readme",
+  "bugs": {
+    "url": "https://github.com/yolo-labs-hq/videostitcher/issues"
+  },
+  "type": "module",
+  "bin": {
+    "videostitcher": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test --test-reporter=spec dist/*.test.js",
+    "clean": "rm -rf dist",
+    "vendor:sdk": "node scripts/vendor-sdk.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.98.0",
+    "commander": "^12.1.0",
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/ffprobe-static": "^2.0.3",
+    "@types/node": "^20.0.0",
+    "@yolo-labs/app-sdk": "^0.8.0",
+    "typescript": "^5.4.0"
+  }
+}
