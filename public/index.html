@@ -5889,10 +5889,15 @@ refreshState();
   var fmt = function (n) { return (n / 1048576).toFixed(1) + ' MB'; };
 
   // ── (1) Import from workspace ──────────────────────────────────────────────
-  // Two paths, chosen at runtime:
-  //  • Sandboxed tile-app: the bwrap sandbox can't see workspace files, so we go
-  //    through the capability broker (postMessage to the host → fs.list/fs.read,
-  //    grant-enforced). fs.read returns base64 which we POST to /api/upload.
+  // Three paths, tried in this order at runtime:
+  //  • MCP folder scopes (preferred): the bwrap sandbox can't see workspace
+  //    files, so we go through the capability broker (postMessage to the host →
+  //    mcp.call on studio.list_files / studio.read_file, granted for the
+  //    cam-rig/ folder only). Reads are base64 ranges, stitched in a Blob and
+  //    POSTed to /api/upload.
+  //  • Legacy fs bridge (fs.list/fs.read:workspace): the same, for hosts where
+  //    mcp.call / the folder scopes are not on yet. Retired with
+  //    TILEAPP_FS_RETIRED (docs/TILEAPP_FS_READ_CAPABILITY.md).
   //  • Local-server preview (or pure UI): no broker host replies, so we fall back
   //    to the server's own /api/workspace-videos + /api/import-from-workspace,
   //    which read the pod filesystem directly.
@@ -5908,8 +5913,58 @@ refreshState();
     if (!app) return Promise.reject(new Error('no-bridge'));
     return app.call(capability, method, args || {}, { timeoutMs: timeoutMs || 3000 }).then(function (r) {
       if (r && r.ok) return r.payload;
-      throw new Error((r && (r.message || r.reason)) || 'bridge-error');
+      var err = new Error((r && (r.message || r.reason)) || 'bridge-error');
+      err.reason = r && r.reason;
+      throw err;
     });
+  }
+
+  // ── Workspace files through MCP folder scopes ──
+  // The grant is for cam-rig/ only (read-only). Paths are workspace-relative.
+  var WS_FOLDER = 'cam-rig';
+  var WS_LIST_SCOPE = 'studio.list_files:' + WS_FOLDER + '/**';
+  var WS_READ_SCOPE = 'studio.read_file:' + WS_FOLDER + '/**';
+  var WS_VIDEO_RE = /\.(mp4|webm|mov|mkv|m4v)$/i;
+  var WS_READ_CHUNK = 3 * 1024 * 1024;        // the pod's cap per ranged read
+  var WS_READ_MAX_BYTES = 256 * 1024 * 1024;  // same ceiling the fs bridge had
+  function mcpFiles(route, scope, body, timeoutMs) {
+    return bridgeCall('mcp', 'call', { scopes: [scope], path: '/files/' + route, method: 'POST', body: body }, timeoutMs);
+  }
+  function dirOf(p) { var i = p.lastIndexOf('/'); return i >= 0 ? p.slice(0, i) : ''; }
+  function decodeB64(b64) {
+    var bin = atob(b64 || ''); var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+  // The takes under cam-rig/, newest first, in the shape the fs bridge listed them.
+  function listVideosViaMcp() {
+    return mcpFiles('list', WS_LIST_SCOPE, { depth: 6, mtime: true }, 15000).then(function (p) {
+      var entries = (p && p.entries) || [];
+      var root = (p && p.root) || WS_FOLDER;
+      var sidecarDirs = {};
+      entries.forEach(function (e) { if (e.type === 'file' && /(^|\/)inputs\.json$/.test(e.path)) sidecarDirs[dirOf(e.path)] = true; });
+      var vids = entries.filter(function (e) { return e.type === 'file' && WS_VIDEO_RE.test(e.path); }).map(function (e) {
+        return { path: root + '/' + e.path, name: e.path.slice(e.path.lastIndexOf('/') + 1), sizeBytes: e.size, mtimeMs: e.mtimeMs, hasSidecar: !!sidecarDirs[dirOf(e.path)] };
+      });
+      vids.sort(function (a, b) { return (b.mtimeMs || 0) - (a.mtimeMs || 0); });
+      return { videos: vids.slice(0, 200), roots: [root + '/'] };
+    });
+  }
+  // One file's bytes as a Blob, read in base64 ranges. onProgress(done, total) is optional.
+  function readFileViaMcp(path, timeoutMs, onProgress) {
+    var parts = []; var offset = 0;
+    function next() {
+      return mcpFiles('read', WS_READ_SCOPE, { path: path, encoding: 'base64', offset: offset, maxBytes: WS_READ_CHUNK }, timeoutMs).then(function (p) {
+        // A pod that predates binary reads answers text; never mistake that for bytes.
+        if (!p || p.encoding !== 'base64' || typeof p.content !== 'string') throw new Error('workspace file read is not available');
+        if (typeof p.size === 'number' && p.size > WS_READ_MAX_BYTES) throw new Error('file too large (' + p.size + ' > ' + WS_READ_MAX_BYTES + ' bytes)');
+        var bytes = decodeB64(p.content);
+        parts.push(bytes); offset += bytes.length;
+        if (onProgress) onProgress(offset, p.size);
+        return p.truncated && bytes.length > 0 ? next() : new Blob(parts, { type: 'application/octet-stream' });
+      });
+    }
+    return next();
   }
   function openModal() {
     closeModal();
@@ -5947,7 +6002,7 @@ refreshState();
       return (i >= 0 ? videoPath.slice(0, i) : '.') + '/inputs.json';
     }
 
-    function renderVideos(allVids, roots, viaBridge) {
+    function renderVideos(allVids, roots, via) {
       var search = card.querySelector('#__ws_search');
       if (!allVids || !allVids.length) {
         list.innerHTML = 'No videos found' + (roots && roots.length ? ' under:<br>' + roots.join('<br>') : '.');
@@ -5985,7 +6040,7 @@ refreshState();
           var fail = function (msg) { row.innerHTML = '<div style="color:#ff8080">Import failed: ' + msg + '</div>'; };
           row.onclick = function () {
             row.innerHTML = '<div style="color:#b9a7ff">Importing ' + v.name + '…</div>';
-            if (viaBridge) {
+            if (via === 'mcp' || via === 'fs') {
               // Read the mp4 via the broker, upload it (creates a fresh project),
               // then — if this take has a foley sidecar — read inputs.json via the
               // broker too and POST it to /api/upload-sidecar so auto-foley works.
@@ -5993,11 +6048,18 @@ refreshState();
               // the sidecar is a deliberate second hop. Best-effort: a sidecar
               // failure never blocks the import.
               var importedName = (v.name);
-              bridgeCall('fs', 'read', { scope: 'workspace', path: v.path }, 90000)
-                .then(function (p) {
-                  importedName = (p && p.name) || v.name;
+              var readVideo = via === 'mcp'
+                ? readFileViaMcp(v.path, 60000, function (done, total) {
+                    row.innerHTML = '<div style="color:#b9a7ff">Importing ' + v.name + '… ' + fmt(done) + (total ? ' / ' + fmt(total) : '') + '</div>';
+                  })
+                : bridgeCall('fs', 'read', { scope: 'workspace', path: v.path }, 90000).then(function (p) {
+                    importedName = (p && p.name) || v.name;
+                    return new Blob([b64ToBytes(p && p.base64)], { type: 'application/octet-stream' });
+                  });
+              readVideo
+                .then(function (blob) {
                   return fetch('/api/upload?name=' + encodeURIComponent(importedName), {
-                    method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: b64ToBytes(p && p.base64),
+                    method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: blob,
                   });
                 })
                 .then(function (resp) {
@@ -6008,11 +6070,16 @@ refreshState();
                   var projectId = j && j.projectId;
                   if (!v.hasSidecar || !projectId) return; // nothing to ride along
                   row.innerHTML = '<div style="color:#b9a7ff">Importing ' + v.name + ' (foley)…</div>';
-                  return bridgeCall('fs', 'read', { scope: 'workspace', path: sidecarPathFor(v.path) }, 30000)
+                  var readSidecar = via === 'mcp'
+                    ? readFileViaMcp(sidecarPathFor(v.path), 30000)
+                    : bridgeCall('fs', 'read', { scope: 'workspace', path: sidecarPathFor(v.path) }, 30000).then(function (sp) {
+                        return sp && sp.base64 ? new Blob([b64ToBytes(sp.base64)], { type: 'application/json' }) : null;
+                      });
+                  return readSidecar
                     .then(function (sp) {
-                      if (!sp || !sp.base64) return;
+                      if (!sp) return;
                       return fetch('/api/upload-sidecar?projectId=' + encodeURIComponent(projectId) + '&videoName=' + encodeURIComponent(importedName), {
-                        method: 'POST', headers: { 'content-type': 'application/json' }, body: b64ToBytes(sp.base64),
+                        method: 'POST', headers: { 'content-type': 'application/json' }, body: sp,
                       });
                     })
                     .catch(function () { /* best-effort: foley is optional, don't fail the import */ });
@@ -6034,12 +6101,18 @@ refreshState();
       draw('');
     }
 
-    // Bridge-first (sandboxed tile-app); fall back to the server's own API.
-    bridgeCall('fs', 'list', { scope: 'workspace' }, 4000)
-      .then(function (p) { renderVideos((p && p.videos) || [], (p && p.roots) || [], true); })
+    // MCP folder scopes first (sandboxed tile-app), then the legacy fs bridge
+    // (hosts without mcp.call / the scopes, or an app granted only fs.read),
+    // then the server's own API.
+    listVideosViaMcp()
+      .then(function (p) { renderVideos(p.videos, p.roots, 'mcp'); })
+      .catch(function () {
+        return bridgeCall('fs', 'list', { scope: 'workspace' }, 4000)
+          .then(function (p) { renderVideos((p && p.videos) || [], (p && p.roots) || [], 'fs'); });
+      })
       .catch(function () {
         fetch('/api/workspace-videos').then(function (r) { return r.json(); })
-          .then(function (j) { renderVideos((j && j.videos) || [], (j && j.roots) || [], false); })
+          .then(function (j) { renderVideos((j && j.videos) || [], (j && j.roots) || [], 'server'); })
           .catch(function (e) { list.innerHTML = '<span style="color:#ff8080">' + e + '</span>'; });
       });
   }
